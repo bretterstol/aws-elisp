@@ -89,6 +89,30 @@ sessions are always displayed regardless of this setting."
   :type 'boolean
   :group 'aws-ssm)
 
+(defcustom aws-ssm-shell-display 'frame
+  "Where a shell session is shown.
+
+`frame' gives the shell a GUI frame of its own, so a full-screen terminal
+never rearranges the windows you were working in; the frame is deleted
+again when the session ends.  `window' displays the vterm buffer in the
+selected frame, like any other buffer.  `iterm' hands the session to
+iTerm2 rather than running it inside Emacs -- those sessions live outside
+Emacs, so they are neither listed in the status buffer nor killable from
+it."
+  :type '(choice (const :tag "A frame of its own" frame)
+                 (const :tag "The selected frame" window)
+                 (const :tag "iTerm2" iterm))
+  :group 'aws-ssm)
+
+(defcustom aws-ssm-shell-frame-parameters
+  '((width . 132) (height . 43))
+  "Frame parameters of the frames `aws-ssm-shell-display' opens.
+
+The `name' parameter defaults to the instance the shell runs on; set it
+here to override that."
+  :type '(alist :key-type symbol :value-type sexp)
+  :group 'aws-ssm)
+
 (defcustom aws-ssm-abbreviate-hosts t
   "When non-nil, shorten AWS service suffixes of hosts in the status buffer.
 
@@ -724,6 +748,59 @@ One shell and any number of port forwards can coexist per instance."
   (unless (process-live-p process)
     (aws-ssm--refresh-status-buffer)))
 
+(defun aws-ssm--shell-command (instance spec)
+  "Return the shell command line starting a session to INSTANCE per SPEC."
+  (mapconcat #'shell-quote-argument
+             (cons aws-ssm-executable (aws-ssm--session-args instance spec))
+             " "))
+
+(defun aws-ssm--shell-frame-parameters (instance)
+  "Return the parameters of the frame holding INSTANCE's shell."
+  (let ((parameters (copy-alist aws-ssm-shell-frame-parameters)))
+    (if (assq 'name parameters)
+        parameters
+      (cons (cons 'name (format "aws-ssm: %s" (aws-ssm-instance-name instance)))
+            parameters))))
+
+(defun aws-ssm--display-shell-in-frame (buffer instance)
+  "Display BUFFER, a shell on INSTANCE, in a frame of its own.
+
+The frame is deleted once BUFFER is killed, which vterm does as soon as
+the session ends."
+  (let ((frame (make-frame (aws-ssm--shell-frame-parameters instance))))
+    (with-selected-frame frame
+      (switch-to-buffer buffer)
+      (set-window-dedicated-p (frame-selected-window frame) t))
+    (with-current-buffer buffer
+      (add-hook 'kill-buffer-hook
+                (lambda ()
+                  ;; Deleting the last frame would take Emacs down with it.
+                  (when (and (frame-live-p frame) (cdr (frame-list)))
+                    (delete-frame frame)))
+                nil t))
+    (select-frame-set-input-focus frame)
+    frame))
+
+(defun aws-ssm--applescript-string (string)
+  "Return STRING as an AppleScript string literal."
+  (format "\"%s\"" (replace-regexp-in-string "[\\\"]" "\\\\\\&" string)))
+
+(defun aws-ssm--start-shell-in-iterm (instance spec)
+  "Open a shell on INSTANCE following SPEC in a new iTerm2 window.
+
+The session belongs to iTerm2, not to Emacs, so it is not registered as
+one of `aws-ssm--sessions'."
+  (let ((script (format "tell application \"iTerm\"
+  create window with default profile command %s
+  activate
+end tell"
+                        (aws-ssm--applescript-string
+                         (aws-ssm--shell-command instance spec)))))
+    (with-temp-buffer
+      (unless (zerop (call-process "osascript" nil t nil "-e" script))
+        (user-error "aws-ssm: iTerm2 refused the session: %s"
+                    (string-trim (buffer-string)))))))
+
 (defun aws-ssm--start-shell (key instance spec)
   "Open a vterm shell session KEY on INSTANCE following SPEC."
   (unless (require 'vterm nil t)
@@ -733,11 +810,7 @@ One shell and any number of port forwards can coexist per instance."
     ;; vterm starts its shell from `vterm-mode', so a stale buffer has to go
     ;; before a new session can reuse the name.
     (when existing (kill-buffer existing))
-    (let* ((command (mapconcat #'shell-quote-argument
-                               (cons aws-ssm-executable
-                                     (aws-ssm--session-args instance spec))
-                               " "))
-           (vterm-shell command)
+    (let* ((vterm-shell (aws-ssm--shell-command instance spec))
            (buffer (get-buffer-create name)))
       (with-current-buffer buffer
         (vterm-mode)
@@ -748,7 +821,9 @@ One shell and any number of port forwards can coexist per instance."
         (when (fboundp 'evil-emacs-state)
           (evil-emacs-state)))
       (aws-ssm--register-session key instance spec buffer)
-      (pop-to-buffer buffer)
+      (if (and (eq aws-ssm-shell-display 'frame) (display-graphic-p))
+          (aws-ssm--display-shell-in-frame buffer instance)
+        (pop-to-buffer buffer))
       buffer)))
 
 (defun aws-ssm--start-forward (key instance spec)
@@ -770,9 +845,19 @@ One shell and any number of port forwards can coexist per instance."
 SPEC is a plist.  With a :port it starts a port forward, binding
 :local-port locally (defaulting to :port) and, when :host is given,
 forwarding to that host through the instance.  Without a :port it opens
-a shell.  If the same session is already up its buffer is displayed
-instead of a second one being started."
+a shell, where `aws-ssm-shell-display' decides.  If the same session is
+already up its buffer is displayed instead of a second one being
+started."
   (interactive (list (aws-ssm--instance-at-point-or-read)))
+  (if (and (null (plist-get spec :port)) (eq aws-ssm-shell-display 'iterm))
+      (progn
+        (aws-ssm--start-shell-in-iterm instance spec)
+        (message "aws-ssm: %s started in iTerm2"
+                 (aws-ssm-instance-name instance)))
+    (aws-ssm--connect-in-emacs instance spec)))
+
+(defun aws-ssm--connect-in-emacs (instance spec)
+  "Connect to INSTANCE following SPEC, in a buffer of this Emacs."
   (let ((key (aws-ssm--session-key instance spec)))
     (if (aws-ssm-session-live-p key)
         (progn
