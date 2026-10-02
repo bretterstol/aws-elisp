@@ -16,7 +16,7 @@ Instances (3)
   ● myapp-worker             i-04f3e2d1c0b9a8877   t3.small   10.0.2.31
     myapp-batch              i-0997e6d5c4b3a2211   m5.large   10.0.2.87
 
-? help   RET shell   p port   o host   D database   x kill   P profile   g r refresh
+? help   RET shell   p port   o host   D database   u send   x kill   P profile   g r refresh
 ```
 
 There is nothing to declare up front. The only thing aws-ssm cares about is
@@ -53,6 +53,7 @@ instance and act on it; `?` opens the transient with every action.
 | `p` | Forward a port on the instance, prompting for remote and local port |
 | `o` | Forward through the instance to another host, prompting for host and ports |
 | `D` | Forward to an RDS or DocumentDB database discovered in AWS — no host or port to type |
+| `u` | Send a small local file (config and the like) to the instance — see [Sending files](#sending-files) |
 | `x` / `X` | Kill the session at point / kill all sessions |
 | `r` | Restart the session at point |
 | `s` | Show the session buffer |
@@ -145,6 +146,39 @@ One shell and any number of forwards can run against the same instance at once;
 each session is identified by the instance plus its local port. Killing a
 session sends `SIGINT` first so the CLI can tear down the
 `session-manager-plugin` child, falling back to `SIGKILL` after two seconds.
+
+## Sending files
+
+`u` copies a local file to the instance at point. It asks for the file, then
+for where to put it on the instance:
+
+- an absolute path such as `/etc/nginx/conf.d/app.conf`, or
+- a directory — an existing one, or any path ending in `/` — where the file
+  keeps its own name.
+
+Session Manager has no file transfer of its own, so the file travels inside an
+`AWS-RunShellScript` command (`aws ssm send-command`), base64 encoded, and is
+decoded on the instance. That needs no S3 bucket, SSH key or open port, but
+**the file must be small: about 45 KB at most**, since SSM caps a command at
+64 KB including the document itself. Larger files are refused before anything
+is sent. That covers configuration files and scripts; it is not meant for
+archives or dumps.
+
+On the instance:
+
+- The command runs as **root**. A new file is owned by root; fix permissions
+  yourself if something else needs to read it.
+- An **existing file is kept as `FILE.bak`** and then overwritten in place, so
+  it keeps its owner and mode. An earlier `.bak` is replaced.
+- Missing parent directories are created.
+- A SHA-256 checksum is compared after decoding, and nothing is written if
+  it does not match.
+
+The command runs in the background; the echo area reports where the file
+landed, or the error from the instance. It needs `base64` and `sha256sum` on
+the instance, which every common Linux AMI has — Windows instances are not
+supported. Your credentials need `ssm:SendCommand` and
+`ssm:GetCommandInvocation` in addition to what sessions use.
 
 ## Profiles
 

@@ -39,6 +39,10 @@
 ;; `D' skips the typing for databases: it lists the RDS instances and the
 ;; Aurora and DocumentDB clusters of the profile, writer and reader endpoints
 ;; alike, and forwards to the chosen one on its own port.
+;;
+;; `u' sends a small local file, such as a configuration file, to the
+;; instance at point.  It travels inside an SSM command, so it needs no
+;; bucket or SSH, but it is limited to about 45 KB.
 
 ;;; Code:
 
@@ -1034,6 +1038,168 @@ PROFILE becomes the current profile of the status buffer."
           (message "aws-ssm: copied %s" url))
       (message "aws-ssm: no URL scheme known for %s" key))))
 
+;;;; Sending files
+
+;; Session Manager has no file transfer of its own.  A small file is instead
+;; carried inside an `AWS-RunShellScript' command, base64 encoded, and
+;; decoded on the instance.  That command is capped at 64 KB together with
+;; the document itself, which bounds the file at roughly 45 KB: plenty for
+;; configuration, too little for anything else.
+
+(defconst aws-ssm--send-file-max-payload 60000
+  "Largest base64-encoded file, in bytes, that fits in one command.")
+
+(defconst aws-ssm--send-file-poll-limit 120
+  "How many times to ask after a sent file before giving up.")
+
+(defvar aws-ssm--send-file-history nil
+  "Destinations given to `aws-ssm-send-file'.")
+
+(defun aws-ssm--send-file-script (file destination)
+  "Return the shell script writing the contents of FILE to DESTINATION.
+
+DESTINATION is a path on the instance; when it names a directory the
+file keeps its own name there.  An existing file is copied to
+DESTINATION.bak and then overwritten in place, so it keeps its owner and
+mode; a new file belongs to root, whom the command runs as."
+  (let (encoded hash)
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert-file-contents-literally file)
+      (setq hash (secure-hash 'sha256 (current-buffer)))
+      (base64-encode-region (point-min) (point-max) t)
+      (setq encoded (buffer-string)))
+    (when (> (length encoded) aws-ssm--send-file-max-payload)
+      (user-error "aws-ssm: %s is too large to send through SSM (max ~45 KB)"
+                  (file-name-nondirectory file)))
+    (format "set -e
+dest=%s
+if [ -d \"$dest\" ]; then dest=\"$dest/\"%s; fi
+mkdir -p \"$(dirname \"$dest\")\"
+tmp=\"$dest.aws-ssm.$$\"
+trap 'rm -f \"$tmp\"' EXIT
+printf '%%s' '%s' | base64 -d > \"$tmp\"
+if [ \"$(sha256sum < \"$tmp\" | cut -d' ' -f1)\" != %s ]; then
+  echo 'checksum mismatch after decoding' >&2
+  exit 1
+fi
+if [ -e \"$dest\" ]; then
+  cp -p \"$dest\" \"$dest.bak\"
+  cat \"$tmp\" > \"$dest\"
+  echo \"$dest (previous kept as $dest.bak)\"
+else
+  mv \"$tmp\" \"$dest\"
+  echo \"$dest\"
+fi"
+            (shell-quote-argument destination)
+            (shell-quote-argument (file-name-nondirectory file))
+            encoded
+            hash)))
+
+(defun aws-ssm--poll-send-file (context attempt)
+  "Report on the command sending a file once it has finished.
+
+CONTEXT is a plist with :profile, :region, :command-id, :instance and
+:file.  ATTEMPT counts the polls so far."
+  (let ((profile (plist-get context :profile))
+        (instance (plist-get context :instance)))
+    (aws-ssm--run-async
+     (list "ssm" "get-command-invocation"
+           "--command-id" (plist-get context :command-id)
+           "--instance-id" (aws-ssm-instance-id instance)
+           "--profile" profile
+           "--region" (plist-get context :region)
+           "--query" "[Status,StandardOutputContent,StandardErrorContent]"
+           "--output" "json")
+     (lambda (status output)
+       (pcase-let ((`[,state ,stdout ,stderr]
+                    (if (zerop status)
+                        (json-parse-string output :null-object nil)
+                      (vector nil nil nil))))
+         (cond
+          ((equal state "Success")
+           (message "aws-ssm: sent %s to %s:%s"
+                    (file-name-nondirectory (plist-get context :file))
+                    (aws-ssm-instance-name instance)
+                    (string-trim (or stdout ""))))
+          ((>= attempt aws-ssm--send-file-poll-limit)
+           (message "aws-ssm: gave up waiting for command %s"
+                    (plist-get context :command-id)))
+          ((or (member state '("Pending" "InProgress" "Delayed"))
+               ;; The invocation does not exist until the command has
+               ;; reached the instance, so this failure is expected early.
+               (and (null state)
+                    (string-match-p "InvocationDoesNotExist" output)))
+           (run-at-time 1 nil #'aws-ssm--poll-send-file context (1+ attempt)))
+          ((null state)
+           (aws-ssm--report-cli-failure profile output))
+          (t
+           (message "aws-ssm: sending %s to %s %s: %s"
+                    (file-name-nondirectory (plist-get context :file))
+                    (aws-ssm-instance-name instance)
+                    (downcase state)
+                    (or (car (last (split-string (or stderr "") "\n" t)))
+                        "no error output")))))))))
+
+(defun aws-ssm-send-file (instance file destination)
+  "Copy the local FILE to DESTINATION on INSTANCE.
+
+The file travels inside an SSM command, so no bucket, SSH key or open
+port is needed, but it has to be small: about 45 KB at most.
+DESTINATION is an absolute path on the instance, or a directory to put
+the file in.  An existing file there is first copied to a .bak beside
+it.  The file is written as root."
+  (interactive
+   (let* ((instance (aws-ssm--instance-at-point-or-read))
+          (file (read-file-name "Send file: " nil nil t)))
+     (list instance
+           file
+           (read-string (format "Send %s to (on %s): "
+                                (file-name-nondirectory file)
+                                (aws-ssm-instance-name instance))
+                        nil 'aws-ssm--send-file-history))))
+  (unless (file-regular-p file)
+    (user-error "aws-ssm: %s is not a regular file" file))
+  (unless (string-prefix-p "/" destination)
+    (user-error "aws-ssm: the destination must be an absolute path"))
+  ;; A trailing slash names a directory that may not exist yet.
+  (when (string-suffix-p "/" destination)
+    (setq destination (concat destination (file-name-nondirectory file))))
+  (let* ((profile (aws-ssm--ensure-profile))
+         (region (aws-ssm-region))
+         (script (aws-ssm--send-file-script file destination))
+         ;; The encoded file is passed as a file rather than an argument,
+         ;; keeping it out of the process list and clear of argv limits.
+         (parameters (make-temp-file "aws-ssm-send-" nil ".json"
+                                     (json-serialize
+                                      `((commands . [,script])
+                                        (executionTimeout . ["60"]))))))
+    (message "aws-ssm: sending %s to %s..."
+             (file-name-nondirectory file) (aws-ssm-instance-name instance))
+    (aws-ssm--run-async
+     (list "ssm" "send-command"
+           "--instance-ids" (aws-ssm-instance-id instance)
+           "--document-name" "AWS-RunShellScript"
+           "--comment" (truncate-string-to-width
+                        (format "aws-ssm: send %s" (file-name-nondirectory file))
+                        100)
+           "--parameters" (concat "file://" parameters)
+           "--timeout-seconds" "60"
+           "--profile" profile
+           "--region" region
+           "--query" "Command.CommandId"
+           "--output" "text")
+     (lambda (status output)
+       (delete-file parameters)
+       (if (/= status 0)
+           (aws-ssm--report-cli-failure profile output)
+         (aws-ssm--poll-send-file (list :profile profile
+                                        :region region
+                                        :command-id output
+                                        :instance instance
+                                        :file file)
+                                  0))))))
+
 ;;;; Status buffer
 
 (defconst aws-ssm-buffer-name "*aws-ssm*"
@@ -1141,7 +1307,7 @@ PROFILE becomes the current profile of the status buffer."
       (insert "\n")))
     (insert (propertize
              (concat "? help   RET shell   p port   o host   D database   "
-                     "x kill   P profile   g r refresh")
+                     "u send   x kill   P profile   g r refresh")
              'face 'aws-ssm-header-face)
             "\n")
     (goto-char (point-min))
@@ -1299,7 +1465,8 @@ port is the database's own port."
     ("c" "Connect"       aws-ssm-connect-at-point)
     ("p" "Ask port"      aws-ssm-forward-port)
     ("o" "Ask host+port" aws-ssm-forward-host)
-    ("D" "Database"      aws-ssm-forward-database)]
+    ("D" "Database"      aws-ssm-forward-database)
+    ("u" "Send file"     aws-ssm-send-file)]
    ["Session"
     ("x" "Kill"        aws-ssm-kill-session-at-point)
     ("r" "Restart"     aws-ssm-restart-session-at-point)
@@ -1324,6 +1491,7 @@ port is the database's own port."
   "p"     #'aws-ssm-forward-port
   "o"     #'aws-ssm-forward-host
   "D"     #'aws-ssm-forward-database
+  "u"     #'aws-ssm-send-file
   "x"     #'aws-ssm-kill-session-at-point
   "X"     #'aws-ssm-kill-all-sessions
   "r"     #'aws-ssm-restart-session-at-point
